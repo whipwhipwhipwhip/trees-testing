@@ -1,0 +1,22 @@
+[project]
+name = "trees_testing"
+version = "0.0.1"
+requires-python = ">=3.12"
+dependencies = [
+    "jupyterlab>=4.4.10",
+    "matplotlib>=3.10.7",
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
+    "tqdm>=4.67.1",
+    "lightgbm @ file:///Users/cono/code/LightGBM_RegularisedTrees/dist/lightgbm-4.6.0.99-py3-none-macosx_26_0_arm64.whl",
+    "scikit-learn",
+    "hypothesis",
+    "pytest",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+chalk-diagrams = {git = "https://github.com/danoneata/chalk", rev = "srush-patch-1"}
