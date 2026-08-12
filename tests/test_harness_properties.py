@@ -234,3 +234,94 @@ def test_aggregate_reports_mean_and_sd():
     agg = H.aggregate([{"a": 1.0, "b": 2}, {"a": 3.0, "b": 4}])
     assert agg["a"] == (2.0, 1.0)
     assert agg["b"] == (3.0, 1.0)
+
+
+# --------------------------------------------------------------------------- #
+# GRRF: the guided per-feature penalty
+# --------------------------------------------------------------------------- #
+def test_grrf_gamma_zero_is_plain_regularized(blocks):
+    """gamma=0 must reduce exactly to the unguided penalty regardless of guide.
+
+    lambda_i = (1-gamma)*lambda_0 + gamma*Imp'_i collapses to lambda_0 at
+    gamma=0, so a guide passed with gamma=0 must have no effect at all. If this
+    drifts, every gamma>0 result is measured against the wrong baseline.
+    """
+    X, y, _ = blocks
+    guide = H.importance_guide(X, y, task="classification", num_boost_round=50, seed=0)
+    plain, _, _ = H.fit_and_select(X, y, penalty=0.05, task="classification",
+                                   num_boost_round=100, seed=0, extra_params=SCOPE)
+    guided0, _, _ = H.fit_and_select(X, y, penalty=0.05, task="classification",
+                                     num_boost_round=100, seed=0,
+                                     extra_params=H.grrf_params(guide, 0.0))
+    assert plain == guided0
+
+
+def test_grrf_exempts_the_feature_the_guide_rates_highest(blocks):
+    """At gamma=1, lambda_i == Imp'_i, so the top-rated feature has lambda 1.0
+    (no penalty at all) and must be selected. This is the mechanism that stops an
+    arbitrary early split from deciding which features become penalty-exempt."""
+    X, y, _ = blocks
+    guide = H.importance_guide(X, y, task="classification", num_boost_round=200, seed=0)
+    best_feature = int(np.argmax(guide))
+    sel, _, _ = H.fit_and_select(X, y, penalty=0.01, task="classification",
+                                 num_boost_round=200, seed=0,
+                                 extra_params=H.grrf_params(guide, 1.0))
+    assert best_feature in sel
+
+
+def test_grrf_guide_of_wrong_length_fails_loudly(blocks):
+    """A guide that silently mismatched the feature count would misalign every
+    penalty -- feature i penalized by feature j's score."""
+    X, y, _ = blocks
+    with pytest.raises(Exception, match="unused_feature_penalty_guide"):
+        H.fit_and_select(X, y, penalty=0.1, task="classification",
+                         num_boost_round=5, seed=0,
+                         extra_params=H.grrf_params(np.ones(X.shape[1] - 1), 0.5))
+
+
+def test_importance_guide_is_normalised_to_unit_max(blocks):
+    X, y, _ = blocks
+    g = H.importance_guide(X, y, task="classification", num_boost_round=50, seed=0)
+    assert g.shape == (X.shape[1],)
+    assert g.min() >= 0.0 and abs(g.max() - 1.0) < 1e-12
+
+
+# --------------------------------------------------------------------------- #
+# real-data ground truth (network; skipped if unavailable)
+# --------------------------------------------------------------------------- #
+def test_madelon_ground_truth_is_recoverable():
+    """Madelon's published composition is 20 real + 480 probes, but the indices
+    were never released. We recover them from the correlation structure, so this
+    asserts that recovery agrees with the published counts AND with a completely
+    independent signal (gain importance). If those two ever disagree, the truth
+    set is unsafe and every E6 number scored against it is meaningless.
+
+    Also pins the block structure: single-linkage chains these into one giant
+    block, which silently makes block_coverage 1.00 for every selector.
+    """
+    import trees_testing.real_data as rd
+    pytest.importorskip("sklearn.datasets")
+    try:
+        X, y, t = rd.load_madelon()
+    except Exception as e:                        # offline / OpenML down
+        pytest.skip(f"Madelon unavailable: {type(e).__name__}")
+
+    assert X.shape == (2600, 500)
+    assert len(t["relevant_cols"]) == 20
+    assert len(t["noise_cols"]) == 480
+
+    # Independent route to the same set: top-20 by GAIN importance. (Split
+    # importance is a much noisier ranking here and agrees on only ~17/20 --
+    # use the same measure the exploration and E6 baselines use.)
+    top20 = H.select_by_importance(X, y, 20, importance_type="gain",
+                                   task="classification", num_boost_round=300, seed=0)
+    overlap = len(top20 & set(t["relevant_cols"]))
+    assert overlap >= 18, (
+        f"correlation-derived truth and importance ranking agree on only "
+        f"{overlap}/20 features; the ground truth is not trustworthy")
+
+    # block structure must actually discriminate, not collapse to one block
+    sizes = sorted(len(b) for b in t["blocks"])
+    assert t["n_blocks"] >= 4, f"blocks collapsed: {sizes}"
+    assert max(sizes) <= 8, f"a block swallowed most of the real features: {sizes}"
+    assert sum(sizes) == 20

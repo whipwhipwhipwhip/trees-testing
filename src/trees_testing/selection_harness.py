@@ -394,6 +394,47 @@ def select_by_importance(X, y, k, *, importance_type="gain", task="classificatio
     return set(int(i) for i in np.argsort(-imp)[:k])
 
 
+def importance_guide(X, y, *, task="classification", num_boost_round=200, seed=0,
+                     importance_type="gain"):
+    """Normalised importances Imp'_i = Imp_i / max_j Imp_j from a STOCK model.
+
+    This is the guide vector for GRRF (Deng & Runger 2013): the per-feature
+    penalty becomes lambda_i = (1-gamma)*lambda_0 + gamma*Imp'_i, so a feature
+    the preliminary model rated highly starts out barely penalized.
+
+    The point is to stop an arbitrary early split from deciding which features
+    become penalty-exempt. Plain regularized trees admit whichever feature wins
+    the first noisy comparison and then exempt it permanently; with p >> n or
+    many noise features that is frequently a probe, which is the lock-in failure
+    E5 and E6 both exhibit.
+
+    Costs exactly one ordinary training run -- the same cost as the `stock gain`
+    baseline it is meant to beat, which is worth remembering when judging
+    whether the result justifies the machinery.
+    """
+    import lightgbm as lgb
+
+    objective = ("binary" if len(np.unique(y)) == 2 else "multiclass") \
+        if task == "classification" else "regression"
+    params = {"objective": objective, "verbosity": -1, "seed": seed}
+    if objective == "multiclass":
+        params["num_class"] = int(len(np.unique(y)))
+    booster = lgb.train(params, lgb.Dataset(X, label=y), num_boost_round=num_boost_round)
+    imp = np.asarray(booster.feature_importance(importance_type=importance_type),
+                     dtype=float)
+    top = imp.max()
+    return imp / top if top > 0 else np.zeros_like(imp)
+
+
+def grrf_params(guide, gamma, scope="ensemble"):
+    """extra_params dict enabling the guided penalty for a `fit_and_select` call."""
+    return {
+        "unused_feature_penalty_scope": scope,
+        "unused_feature_penalty_gamma": float(gamma),
+        "unused_feature_penalty_guide": ",".join(f"{v:.6g}" for v in np.asarray(guide)),
+    }
+
+
 def select_by_l1(X, y, k, *, task="classification", seed=0):
     """Top-k by |coefficient| of an L1-penalized linear model.
 
