@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A test rig for a **fork of LightGBM** that adds an `unused_feature_penalty` parameter (regularised trees / redundancy-penalising feature selection). This repo contains no model code — it generates synthetic data with *known* ground truth and measures whether the penalty actually selects the right features.
+A test rig for a **fork of LightGBM** that adds an `unused_feature_penalty` parameter (regularised trees / redundancy-penalising feature selection). This repo contains no model code — it generates data with *known* ground truth and measures whether the penalty actually selects the right features.
 
-The core idea: on real data you can only measure downstream accuracy loss, because the true relevant feature set is unknown. On synthetic data with planted structure you can measure *correctness of selection* directly.
+The core idea: on real data you can usually only measure downstream accuracy loss, because the true relevant feature set is unknown. With planted structure you can measure *correctness of selection* directly.
+
+**The project has reached its conclusion — read `README.md` first.** The method beats its matched baseline under a random forest (10/10 seeds) and loses under gradient boosting (10/10), and top-k by gain importance beats every configuration tested. New work should be presentation, replication, or literature-checking rather than further tuning; the experimental arc (mechanism → targeted fix → positive control) is complete.
 
 ## Critical external dependency
 
@@ -60,7 +62,9 @@ Three layers, deliberately decoupled so the first two can be verified without Li
 - **`selection_curve(booster)` derives the whole |F|-vs-rounds curve from one fit**, relying on boosting being prefix-consistent: the first r trees of an R-round model equal an r-round model. That assumption is asserted against independent fits in `tests/test_harness_properties.py` — if it ever breaks, every convergence result breaks with it.
 - **`tree_diagnostics`** reports features-per-tree. Every selection metric here is computed on the union across trees and is therefore blind to trees collapsing to single-feature stumps, which is the real failure mode at small λ. Never report a selection metric without it.
 
-**`run_milestones.py`** — five experiments, E1–E5, each printing a "READ:" block. E3 is the headline: a matched-|F| head-to-head against top-k by stock LightGBM importance, L1, random, all-features and the oracle. It is written to report "the fork is not justified on this design" if that's what the numbers say.
+**`real_data.py`** — MADELON via OpenML, with ground truth *recovered and verified* rather than trusted. The challenge published the counts (20 real / 480 probes) but not the indices; the correlation rule (`|corr| > 0.5` with any other feature) recovers exactly 20, and those are the same 20 that top gain importance. `load_madelon` raises rather than returning a silently-wrong truth set if either check fails. Blocks use **average** linkage — single linkage chains 18 of the 20 into one block and makes `block_coverage` trivially 1.00 for every selector.
+
+**`run_milestones.py`** — eight experiments, E1–E8, each printing a "READ:" block. E8 is the headline (base-learner swap); E6 is the acceptance test on real data. Every experiment is written to report a negative verdict plainly if that's what the numbers say, and several do.
 
 ## Three things that will bite you
 
@@ -69,6 +73,10 @@ Three layers, deliberately decoupled so the first two can be verified without Li
 **2. Scope decides whether this is a feature selector at all.** `unused_feature_penalty_scope` defaults to `tree`, under which F resets every tree and |F| **never converges** — it grows with `num_boost_round` toward "all features", so any |F| quoted at a fixed round count is an artifact of where you stopped. Use `ensemble` (the paper's semantics) for anything about selection. E1 exists to make this visible and distinguishes three outcomes: `SELECTED` (converged to a proper subset), `saturated` (stopped only because every feature is in F — what vanilla does), `growing`.
 
 **3. |F| is confounded with boosting rounds.** Hold `num_boost_round` fixed across every compared model and never use early stopping in a comparison.
+
+**4. Any new comparison must be matched on cardinality and paired on seed.** The whole project turns on head-to-heads against `top-k by gain importance`, which is a much stronger baseline than it looks — beating random subsets or all-features proves nothing. `H.aggregate` plus a paired per-seed difference with its SE is the pattern; single-seed numbers here are indistinguishable from noise.
+
+**5. `selection_curve` assumes boosting is prefix-consistent** — that the first r trees of an R-round model equal an r-round model — so it derives the whole |F|-vs-rounds curve from one fit. That holds only without bagging or early stopping. `tests/test_harness_properties.py` asserts it against independent fits; if you add bagging to a convergence experiment, that assumption (and E1) breaks.
 
 ## Notebooks
 

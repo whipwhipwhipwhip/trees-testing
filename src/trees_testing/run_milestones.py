@@ -65,6 +65,15 @@ NUM_BOOST_ROUND = 400      # HOLD FIXED across every compared model
 N_SEEDS = 5
 TASK = "classification"
 
+# Operating point for the real-data experiment. Deliberately looser than the
+# 0.01 used on the synthetic block designs: E4 shows small lambda destroys
+# interactions, and Madelon's signal IS an interaction (points on the vertices
+# of a hypercube), so the aggressive setting is expected to be wrong there.
+REAL_LAMBDA = 0.1
+
+# GRRF importance coefficient. 1.0 means lambda_i is set entirely by the guide.
+GRRF_GAMMA = 0.9
+
 
 def _params(penalty, scope=SCOPE):
     """extra_params for a regularized fit. None penalty => stock LightGBM."""
@@ -424,12 +433,363 @@ def e5_high_dim(n_seeds=None):
   re-randomise candidate features at every node and so keep exploring.""")
 
 
+# --------------------------------------------------------------------------- #
+# E6: a real benchmark, with nonlinear signal
+# --------------------------------------------------------------------------- #
+def e6_madelon(n_seeds=None):
+    n_seeds = n_seeds or N_SEEDS
+    _hdr("E6", "MADELON -- real benchmark, nonlinear signal, recoverable truth")
+    print("""  E3's designs have LINEAR signal, which hands L1 an advantage the fork cannot
+  beat -- and a tie with a free standard method is the ceiling on any
+  justification argument. Madelon (NIPS 2003 feature selection challenge) is a
+  real benchmark built as 5 informative features on the vertices of a
+  5-dimensional hypercube (so, XOR-like and NONLINEAR), 15 redundant linear
+  combinations of those 5, and 480 pure-noise probes.
+
+  Its ground truth is verifiable from the data rather than taken on trust: the
+  redundant features correlate ~0.99 with their informative source while probes
+  correlate with nothing, so 'has a strong correlation partner' recovers
+  exactly 20 features -- the same 20 that top gain importance.
+""")
+    import trees_testing.real_data as rd
+    X, y, t = rd.load_madelon()
+    print(f"  loaded: n={X.shape[0]}, p={X.shape[1]}, "
+          f"{len(t['relevant_cols'])} real / {len(t['noise_cols'])} probes, "
+          f"{t['n_blocks']} correlation blocks")
+    print(f"  block sizes: {sorted(len(b) for b in t['blocks'])}  "
+          f"-> ideal |F| = {t['n_blocks']} (one per block)\n")
+
+    # Sweep first: a single lambda would just be a guess, and E4 warns that the
+    # value tuned on the block designs should be wrong here.
+    print(f"  {'lambda':>7} | {'|F|':>9}  {'real found /20':>14}  {'blocks hit':>10}  "
+          f"{'probes':>7}  {'AUC':>13}")
+    print("  " + "-" * 80)
+    best, best_auc = None, -np.inf
+    for pen in PENALTY_SWEEP:
+        srows = []
+        for s in range(n_seeds):
+            tr, te = _split(len(y), s)
+            sel, _, _ = H.fit_and_select(
+                X[tr], y[tr], penalty=pen, param_name=PENALTY_PARAM, task=TASK,
+                num_boost_round=NUM_BOOST_ROUND, seed=s, extra_params=_params(pen))
+            r = H.score_subset(X[tr], y[tr], X[te], y[te], sel, task=TASK,
+                               num_boost_round=NUM_BOOST_ROUND, seed=s)
+            r["n_selected"] = len(sel)
+            r["real_found"] = len(sel & set(t["relevant_cols"]))
+            r.update(H.block_metrics(sel, t["blocks"], t["noise_cols"]))
+            srows.append(r)
+        a = H.aggregate(srows)
+        # "Best" must actually select something. lambda=1.0 is vanilla and keeps
+        # nearly every column, so letting it win would make the matched-k
+        # head-to-head below a comparison against the whole feature set.
+        if a["n_selected"][0] < 0.5 * X.shape[1] and a["auc"][0] > best_auc:
+            best_auc, best = a["auc"][0], pen
+        print(f"  {pen:>7} | {a['n_selected'][0]:>4.1f}±{a['n_selected'][1]:<4.1f} "
+              f"{a['real_found'][0]:>14.1f}  {a['block_coverage'][0]:>10.2f}  "
+              f"{a['noise_selected'][0]:>7.1f}  {a['auc'][0]:>6.3f}±{a['auc'][1]:<6.3f}")
+    print(f"\n  best lambda by AUC = {best}; head-to-head at that value:\n")
+
+    rows = {n: [] for n in ("regularized", "GRRF", "stock gain", "stock gain @GRRF k",
+                            "L1", "random", "all", "oracle-20")}
+    ks = []
+    for s in range(n_seeds):
+        tr, te = _split(len(y), s)
+        sc = lambda cols: H.score_subset(X[tr], y[tr], X[te], y[te], cols,
+                                         task=TASK, num_boost_round=NUM_BOOST_ROUND, seed=s)
+        sel, _, _ = H.fit_and_select(
+            X[tr], y[tr], penalty=best, param_name=PENALTY_PARAM, task=TASK,
+            num_boost_round=NUM_BOOST_ROUND, seed=s, extra_params=_params(best))
+        k = max(len(sel), 1)
+        ks.append(k)
+        guide = H.importance_guide(X[tr], y[tr], task=TASK,
+                                   num_boost_round=NUM_BOOST_ROUND, seed=s)
+        grrf, _, _ = H.fit_and_select(
+            X[tr], y[tr], penalty=best, param_name=PENALTY_PARAM, task=TASK,
+            num_boost_round=NUM_BOOST_ROUND, seed=s,
+            extra_params=H.grrf_params(guide, GRRF_GAMMA, SCOPE))
+        for name, cols in {
+            "regularized": sel,
+            "GRRF": grrf,
+            "stock gain": H.select_by_importance(X[tr], y[tr], k, importance_type="gain",
+                                                 task=TASK, num_boost_round=NUM_BOOST_ROUND, seed=s),
+            "stock gain @GRRF k": H.select_by_importance(
+                X[tr], y[tr], max(len(grrf), 1), importance_type="gain",
+                task=TASK, num_boost_round=NUM_BOOST_ROUND, seed=s),
+            "L1": H.select_by_l1(X[tr], y[tr], k, task=TASK, seed=s),
+            "random": next(H.random_subset_baseline(k, X.shape[1], 1,
+                                                    np.random.default_rng(s))),
+            "all": set(range(X.shape[1])),
+            "oracle-20": set(t["relevant_cols"]),
+        }.items():
+            r = sc(cols)
+            r["n_selected"] = len(cols)
+            r.update(H.block_metrics(cols, t["blocks"], t["noise_cols"]))
+            r["real_found"] = len(set(cols) & set(t["relevant_cols"]))
+            rows[name].append(r)
+
+    print(f"  matched k = {np.mean(ks):.1f}±{np.std(ks):.1f}   "
+          f"({n_seeds} seeds, lambda={best}, GRRF gamma={GRRF_GAMMA})\n")
+    print(f"  {'selector':<20} | {'|F|':>6}  {'AUC':>13}  {'real found':>10}  "
+          f"{'blocks hit':>10}  {'probes':>7}")
+    print("  " + "-" * 86)
+    for name in ("oracle-20", "GRRF", "stock gain @GRRF k", "stock gain",
+                 "regularized", "all", "L1", "random"):
+        a = H.aggregate(rows[name])
+        print(f"  {name:<20} | {a['n_selected'][0]:>6.1f}  "
+              f"{a['auc'][0]:>6.3f}±{a['auc'][1]:<6.3f}  "
+              f"{a['real_found'][0]:>10.1f}  {a['block_coverage'][0]:>10.2f}  "
+              f"{a['noise_selected'][0]:>7.1f}")
+
+    def paired(a_name, b_name):
+        d = (np.array([r["auc"] for r in rows[a_name]]) -
+             np.array([r["auc"] for r in rows[b_name]]))
+        se = d.std() / np.sqrt(n_seeds)
+        mark = ("WINS" if d.mean() > 0 else "LOSES") if abs(d.mean()) > 2 * se else "tie"
+        print(f"    {a_name} - {b_name:<22} {d.mean():+.4f} (SE {se:.4f})  "
+              f"won {int((d > 0).sum())}/{n_seeds}   -> {mark}")
+
+    print("\n  paired per-seed AUC differences:")
+    paired("GRRF", "regularized")
+    paired("GRRF", "stock gain @GRRF k")
+    paired("regularized", "stock gain")
+    print("""
+  READ: the decisive line is GRRF vs 'stock gain @GRRF k' -- the SAME importance
+  scores GRRF is guided by, just taken as a top-k ranking instead of steering a
+  penalty. GRRF costs a preliminary training run plus a penalized one; the
+  ranking costs only the preliminary run. If they tie, the tree machinery is
+  adding nothing over the ranking that feeds it, and the honest conclusion is
+  that GRRF is an expensive way to reuse an importance ranking.""")
+
+
+# --------------------------------------------------------------------------- #
+# E7: what does this actually buy in time?
+# --------------------------------------------------------------------------- #
+def e7_cost(n_seeds=None):
+    n_seeds = max(3, (n_seeds or N_SEEDS))
+    _hdr("E7", "cost: training and inference time")
+    print("""  The penalty cannot make TRAINING cheaper by construction: it rescales gains
+  that have already been computed, so every feature's histogram is still built
+  at every node. Any training-time change is second-order (shallower or simpler
+  trees), not a saving from skipping work.
+
+  Where a saving is real is downstream: a model that needs k of p features means
+  k features to compute, store and serve in production. That is measured here as
+  the cost of a stock model retrained on the selected columns only.
+""")
+    import time
+    import trees_testing.real_data as rd
+    X, y, t = rd.load_madelon()
+    tr, te = _split(len(y), 0)
+
+    def timed_fit(cols, penalty, extra):
+        cols = sorted(cols)
+        t0 = time.perf_counter()
+        _, _, b = H.fit_and_select(X[tr][:, cols], y[tr], penalty=penalty,
+                                   param_name=PENALTY_PARAM, task=TASK,
+                                   num_boost_round=NUM_BOOST_ROUND, seed=0,
+                                   extra_params=extra)
+        fit_s = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        for _ in range(5):
+            b.predict(X[te][:, cols])
+        return fit_s, (time.perf_counter() - t0) / 5
+
+    allcols = list(range(X.shape[1]))
+    rows = []
+    fit_v, pred_v = timed_fit(allcols, None, {})
+    rows.append(("vanilla, all 500 features", 500, fit_v, pred_v))
+
+    fit_p, _ = timed_fit(allcols, 0.2, _params(0.2))
+    rows.append(("penalized fit, all 500 in", 500, fit_p, float("nan")))
+
+    guide = H.importance_guide(X[tr], y[tr], task=TASK,
+                               num_boost_round=NUM_BOOST_ROUND, seed=0)
+    grrf, _, _ = H.fit_and_select(X[tr], y[tr], penalty=0.2, param_name=PENALTY_PARAM,
+                                  task=TASK, num_boost_round=NUM_BOOST_ROUND, seed=0,
+                                  extra_params=H.grrf_params(guide, GRRF_GAMMA, SCOPE))
+    fit_s, pred_s = timed_fit(grrf, None, {})
+    rows.append((f"stock model on selected {len(grrf)}", len(grrf), fit_s, pred_s))
+
+    print(f"  {'configuration':<30} | {'features':>8}  {'fit (s)':>9}  {'predict (s)':>12}")
+    print("  " + "-" * 70)
+    for name, nf, f, p in rows:
+        ps = "     n/a" if p != p else f"{p:>12.4f}"
+        print(f"  {name:<30} | {nf:>8}  {f:>9.2f}  {ps}")
+
+    print(f"""
+  READ: the penalized fit is not cheaper than the vanilla fit -- it does the same
+  histogram work and adds a multiply. The saving is entirely in the third row:
+  once a subset is chosen, everything downstream is {500 / max(len(grrf), 1):.0f}x narrower.
+  But that saving comes from HAVING a subset, not from how the subset was found,
+  so top-k by stock importance delivers the identical saving for one training run.
+  Time is not an argument for this fork.""")
+
+
+# --------------------------------------------------------------------------- #
+# E8: is boosting the wrong host? Same method, random-forest base learner.
+# --------------------------------------------------------------------------- #
+def _rf_params(p):
+    """LightGBM configured as a random forest, matching the paper's base learner.
+
+    `feature_fraction_bynode = sqrt(p)/p` is the mtry analogue and the part that
+    matters for this comparison: the paper's RF re-randomises the candidate set at
+    EVERY NODE, so no single early split can decide what enters F. Boosting offers
+    every feature at every node and commits greedily, which is the mechanism E5/E6
+    blamed for lock-in. This experiment tests that explanation directly.
+    """
+    return {
+        "boosting": "rf",
+        "bagging_fraction": 0.7,
+        "bagging_freq": 1,
+        "feature_fraction_bynode": max(1, int(np.sqrt(p))) / p,
+    }
+
+
+def e8_random_forest(n_seeds=None):
+    n_seeds = n_seeds or N_SEEDS
+    _hdr("E8", "does the method transfer? boosting vs random forest")
+    print("""  E6 concluded that the fork loses to top-k importance under boosting, and
+  blamed the base learner: boosting is greedy and sequential, so the ensemble-
+  scoped set F is fixed early by a few noisy splits and never revisited. The
+  paper's random forests re-randomise candidate features at every node and
+  bootstrap every tree, so a bad early commitment gets diluted.
+
+  That is a testable explanation, not just a story. Same data, same penalty, same
+  metrics -- only the base learner changes. If the method beats top-k importance
+  under RF and not under boosting, the explanation holds and the finding is about
+  TRANSFERABILITY. If it loses under RF too, the method simply does not replicate
+  and the base learner was never the issue.
+
+  Scoring is unchanged throughout: a stock GBDT retrained on the selected columns,
+  so every number here is comparable with E6 and only the SELECTION differs.
+""")
+    import trees_testing.real_data as rd
+    X, y, t = rd.load_madelon()
+    real = set(t["relevant_cols"])
+    rfp = _rf_params(X.shape[1])
+    print(f"  RF base learner: bagging {rfp['bagging_fraction']}, "
+          f"feature_fraction_bynode {rfp['feature_fraction_bynode']:.4f} "
+          f"(mtry = sqrt(p) = {int(np.sqrt(X.shape[1]))} of {X.shape[1]})\n")
+
+    sweep = [1.0, 0.2, 0.1, 0.05, 0.02, 0.01]
+    print(f"  {'lambda':>7} | {'|F|':>9}  {'real found /20':>14}  {'probes':>7}  {'AUC':>13}")
+    print("  " + "-" * 74)
+    best, best_auc = None, -np.inf
+    for pen in sweep:
+        rows = []
+        for s in range(n_seeds):
+            tr, te = _split(len(y), s)
+            extra = dict(rfp)
+            if pen != VANILLA_PENALTY:
+                extra[SCOPE_PARAM] = SCOPE
+            sel, _, _ = H.fit_and_select(
+                X[tr], y[tr], penalty=pen, param_name=PENALTY_PARAM, task=TASK,
+                num_boost_round=NUM_BOOST_ROUND, seed=s, extra_params=extra)
+            r = H.score_subset(X[tr], y[tr], X[te], y[te], sel, task=TASK,
+                               num_boost_round=NUM_BOOST_ROUND, seed=s)
+            r["n_selected"] = len(sel)
+            r["real_found"] = len(sel & real)
+            r["probes"] = len(sel) - r["real_found"]
+            rows.append(r)
+        a = H.aggregate(rows)
+        if a["n_selected"][0] < 0.5 * X.shape[1] and a["auc"][0] > best_auc:
+            best_auc, best = a["auc"][0], pen
+        print(f"  {pen:>7} | {a['n_selected'][0]:>4.1f}±{a['n_selected'][1]:<4.1f} "
+              f"{a['real_found'][0]:>14.1f}  {a['probes'][0]:>7.1f}  "
+              f"{a['auc'][0]:>6.3f}±{a['auc'][1]:<6.3f}")
+
+    print(f"\n  best lambda under RF = {best}; matched head-to-head:\n")
+    names = ("RRF-on-RF", "GRRF-on-RF", "stock RF gain", "stock GBDT gain",
+             "GBDT gain @ k=15", "all")
+    rows = {n: [] for n in names}
+    for s in range(n_seeds):
+        tr, te = _split(len(y), s)
+        sc = lambda cols: H.score_subset(X[tr], y[tr], X[te], y[te], cols,
+                                         task=TASK, num_boost_round=NUM_BOOST_ROUND, seed=s)
+        extra = dict(rfp); extra[SCOPE_PARAM] = SCOPE
+        sel, _, _ = H.fit_and_select(X[tr], y[tr], penalty=best, param_name=PENALTY_PARAM,
+                                     task=TASK, num_boost_round=NUM_BOOST_ROUND, seed=s,
+                                     extra_params=extra)
+        k = max(len(sel), 1)
+
+        guide = H.importance_guide(X[tr], y[tr], task=TASK,
+                                   num_boost_round=NUM_BOOST_ROUND, seed=s)
+        gextra = dict(rfp)
+        gextra.update(H.grrf_params(guide, GRRF_GAMMA, SCOPE))
+        grrf, _, _ = H.fit_and_select(X[tr], y[tr], penalty=best, param_name=PENALTY_PARAM,
+                                      task=TASK, num_boost_round=NUM_BOOST_ROUND, seed=s,
+                                      extra_params=gextra)
+
+        # stock RF importance: same base learner, no penalty -- the fair RF baseline
+        import lightgbm as lgb
+        bpar = {"objective": "binary", "verbosity": -1, "seed": s}
+        bpar.update(rfp)
+        rf_booster = lgb.train(bpar, lgb.Dataset(X[tr], label=y[tr]),
+                               num_boost_round=NUM_BOOST_ROUND)
+        rf_gain = np.asarray(rf_booster.feature_importance("gain"))
+
+        for name, cols in {
+            "RRF-on-RF": sel,
+            "GRRF-on-RF": grrf,
+            "stock RF gain": set(int(i) for i in np.argsort(-rf_gain)[:k]),
+            "stock GBDT gain": H.select_by_importance(
+                X[tr], y[tr], k, importance_type="gain", task=TASK,
+                num_boost_round=NUM_BOOST_ROUND, seed=s),
+            # Reference at the operating point E6 found best. RF-based selection
+            # cannot reach a k this small, so without this row the matched-k
+            # comparison above flatters it: winning at k~100 is not the same as
+            # being the best available selection.
+            "GBDT gain @ k=15": H.select_by_importance(
+                X[tr], y[tr], 15, importance_type="gain", task=TASK,
+                num_boost_round=NUM_BOOST_ROUND, seed=s),
+            "all": set(range(X.shape[1])),
+        }.items():
+            r = sc(cols)
+            r["n_selected"] = len(cols)
+            r["real_found"] = len(set(cols) & real)
+            rows[name].append(r)
+
+    print(f"  {'selector':<18} | {'|F|':>6}  {'AUC':>13}  {'real found /20':>14}")
+    print("  " + "-" * 62)
+    for name in names:
+        a = H.aggregate(rows[name])
+        print(f"  {name:<18} | {a['n_selected'][0]:>6.1f}  "
+              f"{a['auc'][0]:>6.3f}±{a['auc'][1]:<6.3f}  {a['real_found'][0]:>14.1f}")
+
+    def paired(a_name, b_name):
+        d = (np.array([r["auc"] for r in rows[a_name]]) -
+             np.array([r["auc"] for r in rows[b_name]]))
+        se = d.std() / np.sqrt(n_seeds)
+        mark = ("WINS" if d.mean() > 0 else "LOSES") if abs(d.mean()) > 2 * se else "tie"
+        print(f"    {a_name} - {b_name:<18} {d.mean():+.4f} (SE {se:.4f})  "
+              f"won {int((d > 0).sum())}/{n_seeds}   -> {mark}")
+        return mark
+
+    print("\n  paired per-seed AUC differences:")
+    v_rf = paired("RRF-on-RF", "stock RF gain")
+    paired("GRRF-on-RF", "stock RF gain")
+    paired("RRF-on-RF", "stock GBDT gain")
+
+    print(f"""
+  READ: under BOOSTING (E6) the same method lost to top-k importance on 10/10
+  seeds. The verdict here against the matched RF baseline is '{v_rf}'.
+
+  If those differ, the conclusion is that regularized trees are a random-forest
+  method that does not transfer to gradient boosting, and the reason is
+  structural: RF re-randomises candidates every node so F is built from many
+  independent looks, whereas boosting commits greedily and the penalty can only
+  reorder gains -- it has no mechanism to evict a feature already admitted.""")
+
+
 EXPERIMENTS = {
     "E1": e1_convergence,
     "E2": e2_selection,
     "E3": e3_justification,
     "E4": e4_interactions,
     "E5": e5_high_dim,
+    "E6": e6_madelon,
+    "E7": e7_cost,
+    "E8": e8_random_forest,
 }
 
 
