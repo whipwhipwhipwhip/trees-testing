@@ -8,19 +8,21 @@ A test rig for a **fork of LightGBM** that adds an `unused_feature_penalty` para
 
 The core idea: on real data you can usually only measure downstream accuracy loss, because the true relevant feature set is unknown. With planted structure you can measure *correctness of selection* directly.
 
-**The project has reached its conclusion — read `README.md` first.** The method beats its matched baseline under a random forest (10/10 seeds) and loses under gradient boosting (10/10), and top-k by gain importance beats every configuration tested. New work should be presentation, replication, or literature-checking rather than further tuning; the experimental arc (mechanism → targeted fix → positive control) is complete.
+**The project has reached its conclusion — read `README.md` first.** Top-k by gain importance beats every configuration tested, including the complete published algorithm (gain penalty + candidate rule, E9) under both gradient boosting and a random forest. The penalty alone does beat matched top-k under a random forest, but only at |F| ≈ 108, where top-k is barely better than using all features. That result must not be presented as a headline. New work should be presentation, replication, or literature-checking rather than further tuning. `docs/literature-check.md` explains why E9 exists.
 
 ## Critical external dependency
 
-`pyproject.toml` pins LightGBM to a **local wheel**:
+`pyproject.toml` pins LightGBM to an **sdist on the fork's GitHub release** (`v4.6.0.99-rrf.1`), which `uv sync` compiles locally:
 
 ```
-lightgbm @ file:///Users/cono/code/LightGBM_RegularisedTrees/dist/lightgbm-4.6.0.99-py3-none-macosx_26_0_arm64.whl
+lightgbm @ https://github.com/whipwhipwhipwhip/LightGBM_RegularisedTrees/releases/download/v4.6.0.99-rrf.1/lightgbm-4.6.0.99%2Brrf.1.tar.gz
 ```
 
-The `unused_feature_penalty` and `unused_feature_penalty_scope` params only exist in that build. If a run errors on an unknown parameter, the installed library is stale — that's the first thing to check.
+The `unused_feature_penalty*` params only exist in that build, and `lightgbm.__version__` reports `4.6.0.99+rrf.1`. LightGBM warns about unknown parameters rather than failing, so if a param seems to do nothing, check the version first.
 
-**Don't rebuild the wheel during development.** `../LightGBM_RegularisedTrees/rebuild-dev.sh` builds only the C++ shared library and copies it straight into this project's `.venv`, which takes seconds instead of minutes. It works because the LightGBM Python package is a thin ctypes wrapper that locates the library at import time and does not validate parameter names, so a new C++ config field needs no Python-side change. Use `uv sync --reinstall-package lightgbm` only when you want a real wheel again.
+**Never replace the release asset in place** — `uv.lock` pins its sha256, so a re-upload breaks every existing lockfile. A changed fork gets a new release (`rrf.2`): bump `VERSION.txt`, build with `sh build-python.sh sdist` from a venv that has pip (the project `.venv` has none), upload, then repoint `pyproject.toml` and `uv lock`.
+
+**Don't rebuild the wheel during development.** `../LightGBM_RegularisedTrees/rebuild-dev.sh` builds only the C++ shared library and copies it straight into this project's `.venv`, which takes seconds instead of minutes. It works because the LightGBM Python package is a thin ctypes wrapper that locates the library at import time and does not validate parameter names, so a new C++ config field needs no Python-side change. `uv sync --reinstall-package lightgbm` reverts to the released build, discarding any dev-built library.
 
 That script also re-signs the dylib. On Apple Silicon, overwriting a dylib in place invalidates its signature and the kernel SIGKILLs the loading process — Python exits 137 with *no output at all*, which is otherwise very hard to diagnose.
 
@@ -64,7 +66,9 @@ Three layers, deliberately decoupled so the first two can be verified without Li
 
 **`real_data.py`** — MADELON via OpenML, with ground truth *recovered and verified* rather than trusted. The challenge published the counts (20 real / 480 probes) but not the indices; the correlation rule (`|corr| > 0.5` with any other feature) recovers exactly 20, and those are the same 20 that top gain importance. `load_madelon` raises rather than returning a silently-wrong truth set if either check fails. Blocks use **average** linkage — single linkage chains 18 of the 20 into one block and makes `block_coverage` trivially 1.00 for every selector.
 
-**`run_milestones.py`** — eight experiments, E1–E8, each printing a "READ:" block. E8 is the headline (base-learner swap); E6 is the acceptance test on real data. Every experiment is written to report a negative verdict plainly if that's what the numbers say, and several do.
+**`run_milestones.py`** — nine experiments, E1–E9, each printing a "READ:" block. E9 is the decisive one (the full algorithm, both base learners); E6 is the acceptance test on real data.
+
+**`frontier.py`** — the README's headline figure: every configuration on held-out seeds against the top-k-by-gain curve. `compute` needs the fork and writes `results/frontier.json`; `plot` reads only that file and writes `docs/frontier-{light,dark}.png`. Every experiment is written to report a negative verdict plainly if that's what the numbers say, and several do.
 
 ## Three things that will bite you
 

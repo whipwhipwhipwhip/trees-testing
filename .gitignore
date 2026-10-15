@@ -219,3 +219,8 @@ __marimo__/
 
 notebooks/
 *.png
+*.DS_Store
+*.DS_Store/
+# README figures
+!docs/*.png
+docs/*.md

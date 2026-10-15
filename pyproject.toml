@@ -8,15 +8,11 @@ dependencies = [
     "numpy>=2.2.6",
     "pandas>=2.3.3",
     "tqdm>=4.67.1",
-    "lightgbm @ file:///Users/cono/code/LightGBM_RegularisedTrees/dist/lightgbm-4.6.0.99-py3-none-macosx_26_0_arm64.whl",
+    "lightgbm @ https://github.com/whipwhipwhipwhip/LightGBM_RegularisedTrees/releases/download/v4.6.0.99-rrf.1/lightgbm-4.6.0.99%2Brrf.1.tar.gz",
     "scikit-learn",
-    "hypothesis",
     "pytest",
 ]
 
 [build-system]
 requires = ["uv_build>=0.8.4,<0.9.0"]
 build-backend = "uv_build"
-
-[tool.uv.sources]
-chalk-diagrams = {git = "https://github.com/danoneata/chalk", rev = "srush-patch-1"}

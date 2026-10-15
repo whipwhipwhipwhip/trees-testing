@@ -32,6 +32,11 @@ Experiments
   E4  interactions    -- does the penalty destroy XOR pairs? (self-validating:
                          refuses to report if the probe has no power)
   E5  high-dimensional-- p > n, where feature selection actually matters
+  E6  madelon         -- the acceptance test on real data, incl. GRRF
+  E7  cost            -- training and inference time
+  E8  random forest   -- same method, RF base learner: does the verdict flip?
+  E9  mechanisms      -- gain penalty vs the paper's candidate rule, alone and
+                         together, under GBDT and RF
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ import trees_testing.selection_harness as H
 # --------------------------------------------------------------------------- #
 PENALTY_PARAM = "unused_feature_penalty"
 SCOPE_PARAM = "unused_feature_penalty_scope"
+CANDIDATES_PARAM = "unused_feature_penalty_candidates"
 
 # Settled from the fork's own config: 0.0 <= lambda <= 1.0, default 1.0.
 # 1.0 == vanilla, SMALLER == stronger. Matches the paper's lambda.
@@ -75,11 +81,20 @@ REAL_LAMBDA = 0.1
 GRRF_GAMMA = 0.9
 
 
-def _params(penalty, scope=SCOPE):
-    """extra_params for a regularized fit. None penalty => stock LightGBM."""
-    if penalty is None or penalty == VANILLA_PENALTY:
-        return {}
-    return {SCOPE_PARAM: scope}
+def _params(penalty, scope=SCOPE, candidates=None):
+    """extra_params for a regularized fit. No penalty and no rule => stock LightGBM.
+
+    The scope is dropped only when nothing reads F. The candidate rule reads F
+    as well as the penalty does, so lambda=1.0 with the rule on still needs the
+    scope -- dropping it would silently run the rule under `tree` scope.
+    `candidates` None or -1 means the rule is off.
+    """
+    out = {}
+    if candidates is not None and candidates >= 0:
+        out[CANDIDATES_PARAM] = candidates
+    if out or not (penalty is None or penalty == VANILLA_PENALTY):
+        out[SCOPE_PARAM] = scope
+    return out
 
 
 def _split(n, seed):
@@ -781,6 +796,196 @@ def e8_random_forest(n_seeds=None):
   reorder gains -- it has no mechanism to evict a feature already admitted.""")
 
 
+# --------------------------------------------------------------------------- #
+# E9: which of Algorithm 1's two mechanisms does the work?
+# --------------------------------------------------------------------------- #
+E9_LAMBDAS = [0.5, 0.2, 0.1, 0.05, 0.02, 0.01]
+# Settings are chosen on these seeds and reported on seeds 0..n-1. E6/E8 tune and
+# report on the same seeds, which flatters the method -- harmless while it lost,
+# not harmless if a configuration here wins.
+TUNE_SEED_OFFSET = 1000
+
+
+def e9_mechanisms(n_seeds=None):
+    n_seeds = n_seeds or N_SEEDS
+    n_tune = min(5, n_seeds)
+    _hdr("E9", "which mechanism does the work? gain penalty vs candidate rule")
+    print("""  Algorithm 1 of the paper changes the tree learner in two ways: (1) the gain of
+  a feature not yet in F is multiplied by lambda, and (2) every feature in F is
+  always a split candidate while only K random features outside F are -- so a
+  newcomer must beat all of F. E1-E8 tested (1) alone. The paper's boosted
+  variant had (2) as well, so E6's "does not transfer to boosting" never tested
+  the published algorithm.
+
+  Three cells per base learner, each with its own knob swept:
+    penalty only  lambda in E9_LAMBDAS, rule off        (= E6 / E8)
+    rule only     lambda = 1.0, K swept                 (mechanism 2 in isolation)
+    both          lambda swept, K = ceil(sqrt(p))       (the paper)
+  Under RF the rule-on cells drop feature_fraction_bynode: the rule replaces
+  per-node sampling rather than stacking on top of it.
+
+  Each cell's best setting (by AUC, among those keeping |F| < p/2) is chosen on
+  tuning seeds, then compared on separate seeds against top-k by the SAME base
+  learner's gain importance at the SAME k.
+""")
+    import lightgbm as lgb
+    import trees_testing.real_data as rd
+    X, y, t = rd.load_madelon()
+    p = X.shape[1]
+    real = set(t["relevant_cols"])
+    k_paper = int(np.ceil(np.sqrt(p)))
+    k_sweep = sorted({1, max(1, round(k_paper / 4)), max(1, round(k_paper / 2)), k_paper})
+    rfp = _rf_params(p)
+    # (params with the rule off, params with the rule on)
+    learners = {
+        "GBDT": ({}, {}),
+        "RF": (rfp, {k: v for k, v in rfp.items() if k != "feature_fraction_bynode"}),
+    }
+    cells = {
+        "penalty only": [(lam, None) for lam in E9_LAMBDAS],
+        "rule only": [(VANILLA_PENALTY, k) for k in k_sweep],
+        "both": [(lam, k_paper) for lam in E9_LAMBDAS],
+    }
+
+    def setting(pen, k):
+        return " ".join(part for part in (
+            f"lam={pen}" if pen != VANILLA_PENALTY else "",
+            f"K={k}" if k is not None else "") if part)
+
+    def select(Xtr, ytr, seed, learner, pen, k):
+        off, on = learners[learner]
+        extra = {**(on if k is not None else off), **_params(pen, candidates=k)}
+        sel, _, b = H.fit_and_select(Xtr, ytr, penalty=pen, param_name=PENALTY_PARAM,
+                                     task=TASK, num_boost_round=NUM_BOOST_ROUND,
+                                     seed=seed, extra_params=extra)
+        return sel, b
+
+    def score(s, cols):
+        tr, te = _split(len(y), s)
+        return H.score_subset(X[tr], y[tr], X[te], y[te], cols, task=TASK,
+                              num_boost_round=NUM_BOOST_ROUND, seed=s)
+
+    # Unmatched references, shared by both learners: E6's best operating point,
+    # and no selection at all.
+    ref = {"GBDT gain @ k=15": [], "all": []}
+    for s in range(n_seeds):
+        tr, _ = _split(len(y), s)
+        top15 = H.select_by_importance(X[tr], y[tr], 15, importance_type="gain", task=TASK,
+                                       num_boost_round=NUM_BOOST_ROUND, seed=s)
+        for name, cols in (("GBDT gain @ k=15", top15), ("all", set(range(p)))):
+            r = score(s, cols)
+            r["n_selected"] = len(cols)
+            r["real_found"] = len(set(cols) & real)
+            ref[name].append(r)
+
+    verdicts = {}
+    for learner in learners:
+        print(f"\n  ===== base learner: {learner} =====")
+        print(f"  sweep on tuning seeds {TUNE_SEED_OFFSET}..{TUNE_SEED_OFFSET + n_tune - 1}; "
+              f"'selected' = seeds where |F| stopped growing short of all {p}\n")
+        print(f"  {'cell':<13} {'setting':<14} | {'|F|':>11}  {'selected':>8}  "
+              f"{'feat/tree':>9}  {'real /20':>8}  {'probes':>7}  {'AUC':>13}")
+        print("  " + "-" * 92)
+        best = {}
+        for cell, settings in cells.items():
+            candidates = []
+            for pen, k in settings:
+                rows = []
+                for i in range(n_tune):
+                    s = TUNE_SEED_OFFSET + i
+                    tr, _ = _split(len(y), s)
+                    sel, b = select(X[tr], y[tr], s, learner, pen, k)
+                    r = score(s, sel)
+                    r["n_selected"] = len(sel)
+                    r["real_found"] = len(sel & real)
+                    r["probes"] = len(sel - real)
+                    r["feat_per_tree"] = H.tree_diagnostics(b)["mean_features_per_tree"]
+                    r["selected"] = float(H.convergence_report(
+                        H.selection_curve(b), n_features=p)["selected"])
+                    rows.append(r)
+                a = H.aggregate(rows)
+                if a["n_selected"][0] < 0.5 * p:
+                    candidates.append((a["auc"][0], pen, k))
+                n_sel = int(round(a["selected"][0] * n_tune))
+                print(f"  {cell:<13} {setting(pen, k):<14} | "
+                      f"{a['n_selected'][0]:>5.1f}±{a['n_selected'][1]:<5.1f} "
+                      f"{f'{n_sel}/{n_tune}':>8}  {a['feat_per_tree'][0]:>9.2f}  "
+                      f"{a['real_found'][0]:>8.1f}  {a['probes'][0]:>7.1f}  "
+                      f"{a['auc'][0]:>6.3f}±{a['auc'][1]:<6.3f}")
+            best[cell] = max(candidates)[1:] if candidates else None
+            print("  " + "-" * 92)
+
+        live = {c: v for c, v in best.items() if v is not None}
+        for cell in cells:
+            if cell not in live:
+                print(f"  {cell}: no setting keeps |F| below p/2 -- nothing to select with")
+        print("  carried forward: " + ", ".join(f"{c} @ {setting(*v)}" for c, v in live.items()))
+
+        rows = {name: [] for c in live for name in (c, f"top-k gain @ {c}")}
+        off, _ = learners[learner]
+        for s in range(n_seeds):
+            tr, _ = _split(len(y), s)
+            # One stock model per seed: every matched-k baseline is a prefix of the
+            # same ranking, from the same base learner as the selector it is matched to.
+            stock = lgb.train({"objective": "binary", "verbosity": -1, "seed": s, **off},
+                              lgb.Dataset(X[tr], label=y[tr]), num_boost_round=NUM_BOOST_ROUND)
+            order = np.argsort(-np.asarray(stock.feature_importance("gain")))
+            for cell, (pen, k) in live.items():
+                sel, _ = select(X[tr], y[tr], s, learner, pen, k)
+                topk = set(int(i) for i in order[:max(len(sel), 1)])
+                for name, cols in ((cell, sel), (f"top-k gain @ {cell}", topk)):
+                    r = score(s, cols)
+                    r["n_selected"] = len(cols)
+                    r["real_found"] = len(set(cols) & real)
+                    rows[name].append(r)
+
+        print(f"\n  head-to-head on evaluation seeds 0..{n_seeds - 1}:\n")
+        print(f"  {'selector':<26} | {'|F|':>6}  {'AUC':>13}  {'real /20':>8}")
+        print("  " + "-" * 62)
+        for name, rs in [*rows.items(), *ref.items()]:
+            a = H.aggregate(rs)
+            print(f"  {name:<26} | {a['n_selected'][0]:>6.1f}  "
+                  f"{a['auc'][0]:>6.3f}±{a['auc'][1]:<6.3f}  {a['real_found'][0]:>8.1f}")
+
+        def margin(cell):
+            return (np.array([r["auc"] for r in rows[cell]]) -
+                    np.array([r["auc"] for r in rows[f"top-k gain @ {cell}"]]))
+
+        def report(label, d):
+            se = d.std() / np.sqrt(n_seeds)
+            mark = ("WINS" if d.mean() > 0 else "LOSES") if abs(d.mean()) > 2 * se else "tie"
+            print(f"    {label:<40} {d.mean():+.4f} (SE {se:.4f})  "
+                  f"won {int((d > 0).sum())}/{n_seeds}   -> {mark}")
+            return mark
+
+        print("\n  paired per-seed AUC, each cell vs top-k gain at its own k:")
+        # Deliberately no cell-vs-cell line. Cells land at very different k, and
+        # top-k's AUC falls steeply with k, so even the difference of two matched
+        # margins mostly measures k: a margin at k~100 clears a far lower bar than
+        # one at k~20.
+        verdicts[learner] = {c: report(f"{c} - matched top-k", margin(c)) for c in live}
+
+    print("\n  summary (vs matched top-k gain; '-' = no setting kept |F| below p/2):")
+    print(f"  {'':<14}" + "".join(f"{c:>15}" for c in cells))
+    for learner, v in verdicts.items():
+        print(f"  {learner:<14}" + "".join(f"{v.get(c, '-'):>15}" for c in cells))
+    print("""
+  READ: each verdict is a cell against top-k gain importance at that cell's own k.
+  Verdicts are NOT comparable across cells: the cells reach very different k, and
+  top-k's AUC falls steeply as k grows (compare the matched top-k rows), so a win
+  at k~100 clears a much lower bar than a loss at k~20.
+
+  The 'both' column under GBDT is the question E6 could not answer. If it LOSES,
+  the negative result survives the complete published algorithm and is not an
+  artifact of implementing half of it.
+
+  Check 'selected' for each carried-forward setting. A setting still growing at
+  the last round has a k set by num_boost_round rather than by the method.
+
+  Then compare every cell with 'GBDT gain @ k=15': beating top-k at a large k is
+  not the same as being a good selection.""")
+
+
 EXPERIMENTS = {
     "E1": e1_convergence,
     "E2": e2_selection,
@@ -790,6 +995,7 @@ EXPERIMENTS = {
     "E6": e6_madelon,
     "E7": e7_cost,
     "E8": e8_random_forest,
+    "E9": e9_mechanisms,
 }
 
 
