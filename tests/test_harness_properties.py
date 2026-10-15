@@ -16,6 +16,8 @@ a script of module-level asserts. Run it with
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -284,6 +286,153 @@ def test_importance_guide_is_normalised_to_unit_max(blocks):
     g = H.importance_guide(X, y, task="classification", num_boost_round=50, seed=0)
     assert g.shape == (X.shape[1],)
     assert g.min() >= 0.0 and abs(g.max() - 1.0) < 1e-12
+
+
+# --------------------------------------------------------------------------- #
+# candidate rule: the second mechanism of the paper's Algorithm 1
+# --------------------------------------------------------------------------- #
+# Whole-tree comparisons need fits that are reproducible run to run; LightGBM
+# otherwise picks row- or column-wise histograms by timing them.
+DET = {"deterministic": True, "force_row_wise": True, "num_threads": 1}
+
+
+def _fit_trees(X, y, penalty, rounds, seed=0, **params):
+    """Full tree structures, compared whole: two models can share |F| while
+    splitting on different features in different places."""
+    _, _, b = H.fit_and_select(X, y, penalty=penalty, task="classification",
+                               num_boost_round=rounds, seed=seed,
+                               extra_params={**DET, **SCOPE, **params})
+    return b.dump_model()["tree_info"]
+
+
+@pytest.mark.parametrize("penalty", [1.0, 0.05])
+def test_candidates_at_least_m_is_identical_to_rule_off(blocks, penalty):
+    """Drawing every challenger masks nothing, so K >= M must reproduce the rule
+    switched off exactly. Also guards the clamp: Random::Sample returns NO indices
+    when asked for more than it has, which would silently admit no challengers."""
+    X, y, _ = blocks
+    m = X.shape[1]
+    off = _fit_trees(X, y, penalty, 60, unused_feature_penalty_candidates=-1)
+    assert _fit_trees(X, y, penalty, 60, unused_feature_penalty_candidates=m) == off
+    assert _fit_trees(X, y, penalty, 60, unused_feature_penalty_candidates=10 * m) == off
+
+
+def test_candidates_zero_means_ceil_sqrt_m(blocks):
+    """0 is documented as the paper's K = ceil(sqrt(M)). Also checks that it does
+    something, since two no-ops would compare equal too."""
+    X, y, _ = blocks
+    k = math.ceil(math.sqrt(X.shape[1]))
+    auto = _fit_trees(X, y, 0.05, 60, unused_feature_penalty_candidates=0)
+    assert auto == _fit_trees(X, y, 0.05, 60, unused_feature_penalty_candidates=k)
+    assert auto != _fit_trees(X, y, 0.05, 60, unused_feature_penalty_candidates=-1)
+
+
+def test_challengers_are_drawn_at_random(blocks):
+    """With F empty and K=1, the first split has one candidate and it is a random
+    draw, so the root feature must vary with the seed. With the rule off the root
+    is always the single best feature. If this fails, either no draw is happening
+    or it is not seeded from `seed`."""
+    X, y, _ = blocks
+
+    def roots(**params):
+        return {_fit_trees(X, y, None, 1, seed=s, num_leaves=2, **params)[0]
+                ["tree_structure"]["split_feature"] for s in range(40)}
+
+    assert len(roots()) == 1
+    assert len(roots(unused_feature_penalty_candidates=1)) >= 10
+
+
+def test_incumbents_are_never_masked():
+    """The reason the rule is not just feature_fraction_bynode.
+
+    One strong feature among 199 noise features, fitted with stumps and no gain
+    penalty. Once the strong feature is in F the rule must offer it at every node,
+    so it should win essentially every later stump. A symmetric
+    feature_fraction_bynode at the same average rate masks it most of the time,
+    so there it wins only a small share -- that is the approximation this rule
+    exists to replace, and why a constant fraction cannot stand in for it.
+    """
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(3000, 200))
+    y = (X[:, 0] + 0.3 * rng.normal(size=3000) > 0).astype(int)
+    k = math.ceil(math.sqrt(X.shape[1]))
+
+    def share_after_admission(**params):
+        roots = [t["tree_structure"].get("split_feature") for t in
+                 _fit_trees(X, y, None, 150, num_leaves=2, learning_rate=0.02, **params)]
+        assert 0 in roots, "strong feature never admitted, so this test has no power"
+        after = roots[roots.index(0):]
+        return sum(f == 0 for f in after) / len(after)
+
+    assert share_after_admission(unused_feature_penalty_candidates=k) > 0.95
+    assert share_after_admission(feature_fraction_bynode=k / X.shape[1]) < 0.5
+
+
+@pytest.mark.parametrize("scope", ["ensemble", "tree"])
+def test_candidate_rule_keeps_boosting_prefix_consistent(blocks, scope):
+    """selection_curve's assumption, re-checked with the rule on. The rule draws at
+    every node; if its generator were reseeded or advanced by anything that
+    depends on the total round count, the first r trees of a long run would stop
+    matching a short run, and every convergence curve would be wrong."""
+    X, y, _ = blocks
+    params = dict(unused_feature_penalty_scope=scope, unused_feature_penalty_candidates=0)
+    assert _fit_trees(X, y, 0.3, 80, **params)[:30] == _fit_trees(X, y, 0.3, 30, **params)
+
+
+def test_candidate_rule_owns_per_node_sampling(blocks):
+    """With the rule on, feature_fraction_bynode is documented as ignored. If both
+    applied, the incumbent guarantee would be broken by the symmetric sampler."""
+    X, y, _ = blocks
+    on = dict(unused_feature_penalty_candidates=0)
+    assert (_fit_trees(X, y, 0.3, 60, feature_fraction_bynode=0.3, **on)
+            == _fit_trees(X, y, 0.3, 60, **on))
+
+
+def test_candidate_rule_survives_per_iteration_config_resets(blocks):
+    """reset_parameter drives ResetConfig() whenever a value changes. That path
+    restores the column sampler's config fraction, so it must re-apply the bynode
+    override, and it must not clear F or reseed the challenger draw.
+
+    Alternating feature_fraction_bynode forces a reset on every iteration, and
+    since the rule owns bynode the model must not change. The same callback
+    without the rule shows it has teeth, so this cannot pass vacuously.
+    """
+    import lightgbm as lgb
+    X, y, _ = blocks
+    base = {"objective": "binary", "verbosity": -1, "seed": 0, **DET, **SCOPE,
+            "unused_feature_penalty": 0.3, "feature_fraction_bynode": 0.5}
+
+    def trees(callbacks=None, **params):
+        b = lgb.train({**base, **params}, lgb.Dataset(X, y), num_boost_round=50,
+                      callbacks=callbacks)
+        return b.dump_model()["tree_info"]
+
+    def flip():
+        return [lgb.reset_parameter(feature_fraction_bynode=[0.5, 0.4] * 25)]
+
+    assert trees(flip()) != trees(), "callback should change the model with the rule off"
+    on = dict(unused_feature_penalty_candidates=0)
+    assert trees(flip(), **on) == trees(**on)
+
+
+def test_milestone_params_keep_scope_whenever_f_is_read():
+    """run_milestones._params used to return {} at lambda=1.0, which was harmless
+    while only the penalty read F. The candidate rule reads F too, so the
+    rule-only arm (lambda=1.0, rule on) silently ran under `tree` scope."""
+    import trees_testing.run_milestones as M
+    assert M._params(None) == {} and M._params(1.0) == {}
+    assert M._params(1.0, candidates=-1) == {}
+    assert M._params(0.1) == {M.SCOPE_PARAM: M.SCOPE}
+    assert M._params(1.0, candidates=23) == {M.SCOPE_PARAM: M.SCOPE, M.CANDIDATES_PARAM: 23}
+    assert M._params(0.1, candidates=0) == {M.SCOPE_PARAM: M.SCOPE, M.CANDIDATES_PARAM: 0}
+
+
+def test_candidates_below_minus_one_fails_loudly(blocks):
+    X, y, _ = blocks
+    with pytest.raises(Exception, match="unused_feature_penalty_candidates"):
+        H.fit_and_select(X, y, penalty=0.1, task="classification",
+                         num_boost_round=5, seed=0,
+                         extra_params={"unused_feature_penalty_candidates": -2})
 
 
 # --------------------------------------------------------------------------- #
